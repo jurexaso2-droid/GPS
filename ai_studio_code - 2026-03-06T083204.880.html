@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Satellite Tactical Radar</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        :root {
+            --radar-green: #3dfc2e;
+            --radar-glow: rgba(61, 252, 46, 0.3);
+            --bg-dark: #020a02;
+        }
+
+        body {
+            margin: 0;
+            background-color: var(--bg-dark);
+            color: var(--radar-green);
+            font-family: 'Courier New', monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+            touch-action: none;
+        }
+
+        /* Tactical Background Grid */
+        #ui-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                linear-gradient(rgba(61, 252, 46, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(61, 252, 46, 0.05) 1px, transparent 1px);
+            background-size: 20px 20px;
+            z-index: -1;
+        }
+
+        /* Radar Main Container */
+        #radar-boundary {
+            position: relative;
+            width: 350px;
+            height: 350px;
+            border: 2px solid var(--radar-green);
+            border-radius: 50%;
+            box-shadow: 0 0 30px var(--radar-glow);
+            overflow: hidden;
+        }
+
+        /* The Rotating Grid (Controlled by Compass) */
+        #radar-grid {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            transition: transform 0.1s ease-out;
+        }
+
+        .grid-circle {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            border: 1px solid rgba(61, 252, 46, 0.4);
+            border-radius: 50%;
+        }
+
+        .axis {
+            position: absolute;
+            background: rgba(61, 252, 46, 0.4);
+        }
+        .horiz { width: 100%; height: 1px; top: 50%; }
+        .vert { width: 1px; height: 100%; left: 50%; }
+
+        /* The Sweeping Beam */
+        #sweep {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background: conic-gradient(from 0deg, var(--radar-green) 0deg, transparent 90deg);
+            opacity: 0.4;
+            animation: rotate-sweep 3s linear infinite;
+            z-index: 2;
+        }
+
+        @keyframes rotate-sweep {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* Target Dot (The Brother) */
+        #target {
+            position: absolute;
+            width: 15px;
+            height: 15px;
+            background: #ff0000;
+            border-radius: 50%;
+            display: none;
+            z-index: 5;
+            box-shadow: 0 0 15px #ff0000, 0 0 30px #ff0000;
+        }
+
+        .pulse { animation: blink 0.6s infinite; }
+        @keyframes blink { 50% { opacity: 0.2; transform: scale(1.5); } }
+
+        /* Controls */
+        #ui-panel {
+            margin-top: 30px;
+            width: 90%;
+            text-align: center;
+        }
+
+        .btn {
+            background: black;
+            color: var(--radar-green);
+            border: 1px solid var(--radar-green);
+            padding: 12px 20px;
+            font-weight: bold;
+            cursor: pointer;
+            margin: 5px;
+            text-transform: uppercase;
+        }
+
+        .btn:active { background: var(--radar-green); color: black; }
+
+        #link-display {
+            background: rgba(0,0,0,0.8);
+            padding: 10px;
+            font-size: 10px;
+            border: 1px dashed var(--radar-green);
+            margin-top: 10px;
+            word-break: break-all;
+            display: none;
+        }
+
+        #status-bar {
+            font-size: 12px;
+            margin-top: 10px;
+            letter-spacing: 2px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-overlay"></div>
+
+    <div id="parent-view">
+        <div id="radar-boundary">
+            <div id="sweep"></div>
+            <div id="radar-grid">
+                <div class="grid-circle" style="width: 100px; height: 100px;"></div>
+                <div class="grid-circle" style="width: 200px; height: 200px;"></div>
+                <div class="grid-circle" style="width: 300px; height: 300px;"></div>
+                <div class="axis horiz"></div>
+                <div class="axis vert"></div>
+                <div id="target"></div>
+            </div>
+        </div>
+
+        <div id="ui-panel">
+            <button class="btn" onclick="initRadar()">1. Start Radar & Compass</button>
+            <button class="btn" onclick="generateLink()">2. Generate Link</button>
+            <div id="link-display"></div>
+            <button id="copy-btn" class="btn" style="display:none" onclick="copyLink()">Copy Link</button>
+            <div id="status-bar">SATELLITE OFFLINE</div>
+        </div>
+    </div>
+
+    <div id="child-view" style="display:none; text-align: center;">
+        <h2>BEACON TRANSMITTER</h2>
+        <p>Keep this page open so your brother can find you.</p>
+        <button class="btn" onclick="startTransmitting()">Activate Beacon</button>
+        <div id="child-status">Ready...</div>
+    </div>
+
+    <script>
+        let trackerID = new URLSearchParams(window.location.search).get('id') || "RADAR_" + Math.random().toString(36).substr(2, 5).toUpperCase();
+        const isChild = new URLSearchParams(window.location.search).get('role') === 'child';
+        const client = mqtt.connect('wss://test.mosquitto.org:8081');
+        const topic = `field_ops/radar/${trackerID}`;
+
+        let myCoords = null;
+        let brotherCoords = null;
+        let heading = 0;
+
+        if (isChild) {
+            document.getElementById('parent-view').style.display = 'none';
+            document.getElementById('child-view').style.display = 'block';
+        }
+
+        // --- COMPASS & PERMISSIONS ---
+        async function initRadar() {
+            // Request iOS Compass Permission
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                const permission = await DeviceOrientationEvent.requestPermission();
+                if (permission === 'granted') {
+                    window.addEventListener('deviceorientation', handleOrientation);
+                }
+            } else {
+                window.addEventListener('deviceorientation', handleOrientation);
+            }
+
+            // Get GPS
+            navigator.geolocation.watchPosition(pos => {
+                myCoords = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+                document.getElementById('status-bar').innerText = "RADAR ONLINE - SEARCHING...";
+            }, err => alert("Enable GPS"), {enableHighAccuracy: true});
+
+            client.subscribe(topic);
+        }
+
+        function handleOrientation(event) {
+            // Get the compass heading (webkitCompassHeading for iPhone, alpha for Android)
+            heading = event.webkitCompassHeading || (360 - event.alpha);
+            // Rotate the grid based on phone orientation
+            document.getElementById('radar-grid').style.transform = `rotate(${-heading}deg)`;
+            updateTargetPosition();
+        }
+
+        // --- LINK LOGIC ---
+        function generateLink() {
+            const url = `${window.location.origin}${window.location.pathname}?role=child&id=${trackerID}`;
+            const display = document.getElementById('link-display');
+            display.innerText = url;
+            display.style.display = 'block';
+            document.getElementById('copy-btn').style.display = 'inline-block';
+        }
+
+        function copyLink() {
+            const url = document.getElementById('link-display').innerText;
+            navigator.clipboard.writeText(url);
+            alert("Link Copied! Send this to your brother.");
+        }
+
+        // --- TRACKING LOGIC ---
+        client.on('message', (t, msg) => {
+            brotherCoords = JSON.parse(msg.toString());
+            document.getElementById('status-bar').innerText = "TARGET DETECTED - PULSING";
+            updateTargetPosition();
+        });
+
+        function updateTargetPosition() {
+            if (!myCoords || !brotherCoords) return;
+
+            const target = document.getElementById('target');
+            target.style.display = 'block';
+            target.classList.add('pulse');
+
+            // Distance calculation
+            const dLat = (brotherCoords.lat - myCoords.lat) * 111320; 
+            const dLon = (brotherCoords.lon - myCoords.lon) * (40075000 * Math.cos(myCoords.lat * Math.PI / 180) / 360);
+
+            // Scale to radar (Zoom factor)
+            // Even if close, we multiply by a scale so the movement is visible
+            const scale = 2.0; 
+            let x = 175 + (dLon * scale); 
+            let y = 175 - (dLat * scale);
+
+            // Keep dot inside the circle
+            x = Math.max(20, Math.min(330, x));
+            y = Math.max(20, Math.min(330, y));
+
+            target.style.left = x + 'px';
+            target.style.top = y + 'px';
+        }
+
+        // --- CHILD TRANSMITTER ---
+        function startTransmitting() {
+            navigator.geolocation.watchPosition(pos => {
+                const data = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+                client.publish(topic, JSON.stringify(data));
+                document.getElementById('child-status').innerText = "TRANSMITTING COORDINATES...";
+            }, err => alert("GPS Error"), {enableHighAccuracy: true});
+        }
+    </script>
+</body>
+</html>
