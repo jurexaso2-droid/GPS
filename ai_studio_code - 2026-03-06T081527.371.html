@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Satellite Radar Tracker</title>
+    <!-- MQTT Library for real-time communication -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            background-color: #050a05;
+            color: #3cf92f;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Radar Container */
+        #radar-container {
+            position: relative;
+            width: 320px;
+            height: 320px;
+            border: 4px solid #3cf92f;
+            border-radius: 50%;
+            background: radial-gradient(circle, #0a1a0a 0%, #050a05 100%);
+            box-shadow: 0 0 20px #3cf92f33;
+        }
+
+        /* Radar Circles */
+        .circle {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            border: 1px solid rgba(60, 249, 47, 0.3);
+            border-radius: 50%;
+        }
+        .c1 { width: 100px; height: 100px; }
+        .c2 { width: 200px; height: 200px; }
+        .c3 { width: 300px; height: 300px; }
+
+        /* Crosshairs */
+        .axis {
+            position: absolute;
+            background-color: rgba(60, 249, 47, 0.2);
+        }
+        .horizontal { width: 100%; height: 1px; top: 50%; left: 0; }
+        .vertical { width: 1px; height: 100%; left: 50%; top: 0; }
+
+        /* Rotating Beam */
+        #beam {
+            position: absolute;
+            width: 50%;
+            height: 50%;
+            top: 0;
+            left: 50%;
+            background: conic-gradient(from 0deg, #3cf92f66 0deg, transparent 90deg);
+            transform-origin: bottom left;
+            animation: rotate 4s linear infinite;
+            z-index: 2;
+        }
+
+        @keyframes rotate {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* The Blinking Target */
+        #target {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            background-color: #ff0000;
+            border-radius: 50%;
+            display: none;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 15px #ff0000;
+            z-index: 5;
+        }
+
+        .blink {
+            animation: hit-blink 0.5s ease-in-out infinite;
+        }
+
+        @keyframes hit-blink {
+            0%, 100% { opacity: 1; transform: translate(-50%, -50%) scale(1.2); }
+            50% { opacity: 0.3; transform: translate(-50%, -50%) scale(0.8); }
+        }
+
+        /* Controls */
+        #controls {
+            margin-top: 20px;
+            text-align: center;
+            z-index: 10;
+        }
+
+        button {
+            background-color: #3cf92f;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 5px;
+            text-transform: uppercase;
+        }
+
+        #status { font-size: 0.8em; margin-top: 10px; color: #888; }
+        
+        /* Child Mode View */
+        #child-view {
+            display: none;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Parent View: The Radar -->
+    <div id="parent-view">
+        <div id="radar-container">
+            <div id="beam"></div>
+            <div class="circle c1"></div>
+            <div class="circle c2"></div>
+            <div class="circle c3"></div>
+            <div class="axis horizontal"></div>
+            <div class="axis vertical"></div>
+            <div id="target"></div>
+        </div>
+
+        <div id="controls">
+            <button onclick="generateLink()">Generate Tracking Link</button>
+            <div id="status">Waiting for satellite signal...</div>
+        </div>
+    </div>
+
+    <!-- Child View: The Sender -->
+    <div id="child-view">
+        <h1>Satellite Sync</h1>
+        <p>Your brother is looking for you!</p>
+        <button id="start-btn" onclick="startTracking()">Transmit My Location</button>
+        <div id="child-status">Ready to transmit...</div>
+    </div>
+
+    <script>
+        // Use a unique ID so your data doesn't mix with others
+        let trackerID = new URLSearchParams(window.location.search).get('id') || "user_" + Math.random().toString(36).substr(2, 9);
+        const isChild = new URLSearchParams(window.location.search).get('role') === 'child';
+        
+        // MQTT Setup (Public Test Broker)
+        const client = mqtt.connect('wss://test.mosquitto.org:8081');
+        const topic = `family_radar/${trackerID}`;
+
+        if (isChild) {
+            document.getElementById('parent-view').style.display = 'none';
+            document.getElementById('child-view').style.display = 'block';
+        }
+
+        // --- PARENT LOGIC ---
+        client.on('connect', () => {
+            if (!isChild) {
+                client.subscribe(topic);
+                document.getElementById('status').innerText = "Radar Online. Shared link required.";
+            }
+        });
+
+        let lastLocation = null;
+        let parentLocation = null;
+
+        // Get parent's location to center the radar
+        navigator.geolocation.getCurrentPosition(pos => {
+            parentLocation = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+        });
+
+        client.on('message', (t, message) => {
+            const data = JSON.parse(message.toString());
+            lastLocation = data;
+            updateRadar(data);
+        });
+
+        function updateRadar(childCoords) {
+            if (!parentLocation) return;
+            
+            document.getElementById('status').innerText = "TARGET LOCATED: BLINKING RED";
+            const target = document.getElementById('target');
+            target.style.display = 'block';
+            target.classList.add('blink');
+
+            // Simple distance math to place the dot on the radar
+            const dLat = (childCoords.lat - parentLocation.lat) * 111320; // meters
+            const dLon = (childCoords.lon - parentLocation.lon) * 40075000 * Math.cos(parentLocation.lat * Math.PI / 180) / 360;
+
+            // Scale to radar pixels (320px wide, center is 160,160)
+            const scale = 0.5; // adjust zoom
+            const x = 160 + (dLon * scale);
+            const y = 160 - (dLat * scale);
+
+            target.style.left = Math.max(10, Math.min(310, x)) + 'px';
+            target.style.top = Math.max(10, Math.min(310, y)) + 'px';
+        }
+
+        function generateLink() {
+            const url = `${window.location.origin}${window.location.pathname}?role=child&id=${trackerID}`;
+            const message = encodeURIComponent(`Hey! Open this link so I can find you on my radar: ${url}`);
+            window.open(`https://wa.me/?text=${message}`, '_blank');
+        }
+
+        // --- CHILD LOGIC ---
+        function startTracking() {
+            if (navigator.geolocation) {
+                document.getElementById('start-btn').innerText = "TRANSMITTING...";
+                document.getElementById('child-status').innerText = "Satellite link established. Stay safe!";
+                
+                navigator.geolocation.watchPosition(pos => {
+                    const coords = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+                    client.publish(topic, JSON.stringify(coords));
+                }, err => {
+                    alert("Please enable GPS/Location settings.");
+                }, { enableHighAccuracy: true });
+            }
+        }
+    </script>
+</body>
+</html>
